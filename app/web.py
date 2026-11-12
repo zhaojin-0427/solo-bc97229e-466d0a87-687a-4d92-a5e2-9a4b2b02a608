@@ -1,23 +1,33 @@
-"""Flask web entry point: upload daily NetCDF archives, define a subset
-selection, poll job status, and download the single merged NetCDF result."""
+"""Flask web entry point: upload daily NetCDF archives into the shared
+content-addressed store, define a subset selection, poll job status, delete
+finished jobs, and download the single merged NetCDF result."""
 from __future__ import annotations
 
+import json
 import os
 import re
-import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 from flask import (Flask, abort, jsonify, redirect, render_template, request,
                    send_file, url_for)
 from werkzeug.utils import secure_filename
 
-from . import config, jobs
+from . import config, jobs, store
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
 
 SAFE_NAME = re.compile(r"^[\w.\-]+$")
+
+
+@app.template_filter("humanbytes")
+def _humanbytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024.0 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.0f} B"
 
 
 def _parse_epoch(value: str, field: str) -> int:
@@ -52,7 +62,8 @@ def _ensure_worker() -> None:
 
 @app.route("/")
 def index():
-    return render_template("index.html", jobs=jobs.list_jobs())
+    return render_template("index.html", jobs=jobs.list_jobs(),
+                           stats=jobs.store_stats())
 
 
 @app.route("/jobs", methods=["POST"])
@@ -72,9 +83,12 @@ def create_job():
         return render_template("error.html",
                                message="请至少选择一个 NetCDF 文件"), 400
 
-    job_dir = config.UPLOAD_DIR / uuid.uuid4().hex
-    job_dir.mkdir(parents=True, exist_ok=True)
-    stored = []
+    # Receive every upload into the shared store: stream to disk in chunks
+    # (bounded memory), hash the original bytes, publish by digest. Other
+    # requests are not blocked — no lock is held while streaming.
+    received = []   # {"sha256", "name", "size"} for the job row
+    published = []  # ReceivedUpload objects already in the store
+    current = None
     try:
         for seq, f in enumerate(uploads):
             original = f.filename or ""
@@ -88,27 +102,53 @@ def create_job():
                 # Unsafe / non-ASCII / extension-stripped name: generate a
                 # safe one while preserving the real extension.
                 raw_name = f"upload_{seq}{ext}"
-            # Prefix with a sequence to avoid same-name uploads colliding.
-            name = f"{seq:03d}_{raw_name}"
-            dest = job_dir / name
-            f.save(str(dest))
-            stored.append(str(dest))
+            current = store.receive(f.stream)
+            store.publish(current)
+            published.append(current)
+            received.append({"sha256": current.sha256, "name": raw_name,
+                             "size": current.size})
+            current = None
     except Exception as exc:
-        for p in stored:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        try:
-            job_dir.rmdir()
-        except OSError:
-            pass
+        if current is not None:
+            store.discard(current)
+        for rec in published:
+            store.release(rec.sha256)
         return render_template("error.html", message=str(exc)), 400
 
     params = {"t_start": t_start, "t_end": t_end, "south": south,
               "north": north, "west": west, "east": east}
-    job_id = jobs.create_job(params, stored)
+    try:
+        # One transaction: job row + archive reference counts. If this fails,
+        # the published bytes stay unreferenced and are reclaimed by the GC.
+        job_id = jobs.create_job(params, received, storage="shared")
+    except Exception as exc:
+        for rec in published:
+            store.release(rec.sha256)
+        return render_template(
+            "error.html", message=f"任务提交失败，请重试: {exc}"), 500
+    for rec in published:
+        # The job's references now protect the archives from the GC.
+        store.release(rec.sha256)
     return redirect(url_for("job_detail", job_id=job_id))
+
+
+def _job_inputs(job: dict) -> list:
+    """Input files of a job for display: original names (+ digest prefix for
+    shared-storage jobs)."""
+    try:
+        files = json.loads(job["files"])
+    except (ValueError, TypeError):
+        return []
+    inputs = []
+    for item in files:
+        if isinstance(item, dict):
+            inputs.append({"name": item.get("name", "?"),
+                           "sha256": item.get("sha256", "")[:12],
+                           "size": item.get("size")})
+        else:
+            inputs.append({"name": os.path.basename(item),
+                           "sha256": None, "size": None})
+    return inputs
 
 
 @app.route("/jobs/<job_id>")
@@ -116,7 +156,19 @@ def job_detail(job_id: str):
     job = jobs.get_job(job_id)
     if not job:
         abort(404)
-    return render_template("job.html", job=job)
+    return render_template("job.html", job=job, inputs=_job_inputs(job))
+
+
+@app.route("/jobs/<job_id>/delete", methods=["POST"])
+def delete_job(job_id: str):
+    result = jobs.delete_job(job_id)
+    if result is None:
+        abort(404)
+    if result == "busy":
+        return render_template(
+            "error.html",
+            message="任务正在排队或执行中，不能删除；请等待其结束。"), 409
+    return redirect(url_for("index"))
 
 
 @app.route("/api/jobs/<job_id>")
@@ -130,9 +182,16 @@ def api_job(job_id: str):
         "progress": job["progress"],
         "total": job["total"],
         "error": job["error"],
+        "storage": job.get("storage") or "legacy",
+        "deletable": job["status"] in jobs.TERMINAL_STATES,
         "download": (url_for("download", job_id=job["id"])
                      if job["status"] == "SUCCEEDED" else None),
     })
+
+
+@app.route("/api/store")
+def api_store():
+    return jsonify(jobs.store_stats())
 
 
 @app.route("/jobs/<job_id>/download")

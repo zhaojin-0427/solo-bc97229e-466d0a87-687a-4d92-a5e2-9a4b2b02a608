@@ -1,13 +1,22 @@
 {% extends "base.html" %}
 {% block body %}
 <div class="card">
+  <h2>共享存储</h2>
+  <p class="stat">共享归档 <b>{{ stats.count }}</b> 个 · 实际占用
+    <b>{{ stats.bytes|humanbytes }}</b></p>
+  <p class="hint">新上传按原始字节的 SHA-256 去重：相同内容全网只保留一份，
+    同名异内容分别保存；仍被任务引用的归档不会被回收，删除任务后自动释放。</p>
+</div>
+
+<div class="card">
   <h2>1. 上传每日 NetCDF 归档（可多选，格点集合需一致）</h2>
   <form method="post" action="{{ url_for('create_job') }}" enctype="multipart/form-data">
     <label for="files">NetCDF 文件（.nc）</label>
     <input id="files" name="files" type="file" multiple accept=".nc,.cdf,.netcdf" required>
     <p class="hint">文件须仅含 <code>time</code>、<code>lat</code>、<code>lon</code>
       一维坐标与 <code>temperature(time,lat,lon)</code>；time 为递增 Unix 整秒，
-      lon 位于 [0,360) 且递增，各文件纬度顺序可相反。</p>
+      lon 位于 [0,360) 且递增，各文件纬度顺序可相反。上传按内容散列存入共享存储，
+      重复内容不会重复占盘。</p>
 
     <h2 style="margin-top:22px">2. 选择子集（均为闭区间）</h2>
     <div class="grid">
@@ -44,15 +53,25 @@
   <h2>最近任务</h2>
   {% if jobs %}
   <table>
-    <thead><tr><th>任务 ID</th><th>状态</th><th>进度</th><th>创建时间 (UTC)</th><th></th></tr></thead>
+    <thead><tr><th>任务 ID</th><th>状态</th><th>存储</th><th>进度</th><th>创建时间 (UTC)</th><th></th></tr></thead>
     <tbody>
     {% for j in jobs %}
       <tr>
         <td><code>{{ j.id[:12] }}</code></td>
         <td><span class="badge {{ j.status }}">{{ j.status }}</span></td>
+        <td>{% if j.storage == 'shared' %}<span class="badge SHARED">共享</span>{% else %}<span class="badge LEGACY">独立</span>{% endif %}</td>
         <td>{{ j.progress }}/{{ j.total }}</td>
         <td>{{ j.created_at[:19].replace('T',' ') }}</td>
-        <td><a href="{{ url_for('job_detail', job_id=j.id) }}">详情</a></td>
+        <td>
+          <a href="{{ url_for('job_detail', job_id=j.id) }}">详情</a>
+          {% if j.status in ['SUCCEEDED', 'FAILED'] %}
+          <form method="post" action="{{ url_for('delete_job', job_id=j.id) }}"
+                style="display:inline"
+                onsubmit="return confirm('删除该任务？其输入引用将被释放，结果文件将被删除。');">
+            <button type="submit" class="linkbtn">删除</button>
+          </form>
+          {% endif %}
+        </td>
       </tr>
     {% endfor %}
     </tbody>

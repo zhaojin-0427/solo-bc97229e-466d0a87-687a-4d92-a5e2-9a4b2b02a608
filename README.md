@@ -2,7 +2,8 @@
 
 面向海洋研究数据工程师的 Web 服务：上传多个每日 NetCDF 归档，按
 **时间 / 纬度 / 经度**闭区间提取温度子集，跨文件去重合并并输出**单个
-排序后的 NetCDF 文件**。
+排序后的 NetCDF 文件**。上传的归档进入**共享内容寻址存储**，按原始字节
+的 SHA-256 去重，反复提取不同训练区间不再产生重复副本。
 
 ## 功能与约束
 
@@ -26,18 +27,45 @@
 - 任务状态存于 SQLite；**服务重启时所有未完成（QUEUED/RUNNING）任务
   一律标记为 FAILED**，已完成状态与完整文件保持一致。
 
+## 共享归档存储（内容寻址 + 引用计数）
+
+- 新上传不再按任务复制：接收时按 `UPLOAD_CHUNK`（默认 1 MiB）**分块
+  读取、分块计算 SHA-256、分块落盘**，内存占用与文件大小无关；流式
+  接收期间不持有任何全局锁，其他上传、任务查询与删除可并行进行。
+- 完整文件按原始字节摘要发布到 `store/<sha前2位>/<sha256>.nc`：
+  - **相同内容只保留一份**——发布使用无覆盖硬链接（`os.link`），并发
+    上传相同内容时只有一份胜出，其余临时文件被丢弃；
+  - **同名异内容**摘要不同，自然分别保存；
+  - 发布前对临时文件 `fsync`，已受理任务的输入永远完整可读。
+- `archives` 表记录每个摘要被多少任务引用（`refs`）。**任务创建与
+  引用计数 +1 在同一事务提交**：提交失败不会产生悬空引用，已发布的
+  字节成为可回收的未引用遗留。
+- 网页可**删除已结束（SUCCEEDED/FAILED）的任务**：释放其输入引用并
+  删除该任务结果文件；**排队或执行中的任务拒绝删除**（HTTP 409）。
+  引用归零的归档随即被回收；仍被任何任务引用的归档必定保留。
+- 回收器（GC）在删除任务后与服务启动时运行，清理：`refs<=0` 的归档、
+  没有数据库记录的孤儿文件、中断上传的 `.incoming-*` 临时文件。进程内
+  跟踪**进行中的上传**（in-flight 摘要与临时路径），回收绝不会误删
+  并发上传正在复用的文件。
+- 首页实时显示**共享归档数与实际占用字节数**；任务详情页列出每个输入
+  归档的原始文件名、SHA-256 前缀与大小。
+- **旧任务兼容**：共享存储上线前创建的任务行在迁移时标记为
+  `storage='legacy'`，仍按原方式读取各自上传目录中的文件，提取与下载
+  入口不变。
+
 ## 目录结构
 
 ```
 app/
-  config.py     路径与分块参数（DATA_HOME、TIME_CHUNK 等）
+  config.py     路径与分块参数（DATA_HOME、TIME_CHUNK、UPLOAD_CHUNK 等）
+  store.py      共享存储：分块接收 + SHA-256、原子无覆盖发布、in-flight 跟踪
   engine.py     校验、选区索引、分块流式读取、合并去重、原子写出
-  jobs.py       SQLite 任务表、后台 worker、重启恢复
-  web.py        Flask 路由：上传 / 提交 / 状态轮询 / 下载
+  jobs.py       SQLite 任务表 + archives 引用计数、后台 worker、删除与 GC、重启恢复
+  web.py        Flask 路由：上传 / 提交 / 状态轮询 / 删除 / 下载 / 存储统计
   templates/    中文 Web 页面
 scripts/
   make_samples.py  生成反向纬度、跨日期线、重叠冲突三类演示样例
-tests/          unittest 端到端测试（13 项）
+tests/          unittest 端到端测试（26 项）
 Dockerfile
 docker-compose.yml
 gunicorn.conf.py
@@ -56,6 +84,8 @@ docker compose run --rm samples
 #    http://localhost:8000
 #    上传 samples/data 下三个 .nc 文件，表单已预填跨日期线选区
 #    (west=170, east=-170, lat [-10,10])，提交后可下载单个 NetCDF。
+#    重复上传同一批文件，首页“共享归档数 / 实际占用”不会增长；
+#    删除已结束任务后，引用归零的归档与结果文件被自动清理。
 ```
 
 演示样例：
@@ -97,16 +127,25 @@ python -m unittest discover -s tests -t . -v
    保留一个选区大小的累加器，逐文件合并并即时检测冲突。
 4. **原子发布**：`TMP_DIR/.partial-<id>.nc` → `os.replace` 到
    `OUTPUT_DIR/subset_<id>.nc`；SUCCEEDED 状态仅在发布成功后写入。
-5. **重启恢复**：`gunicorn` worker 初始化时调用 `recover_on_startup()`，
-   将所有非终态任务置为 FAILED 并清理 `.partial-*` 临时文件。
-6. **单进程多线程**：SQLite 与后台 worker 为进程内状态，因此 gunicorn
-   固定 1 个 worker、多线程承载并发轮询。
+5. **共享存储去重**：上传分块落盘并流式计算 SHA-256，`os.link`
+   无覆盖发布保证并发相同内容只留一份；`archives.refs` 与任务同事务
+   增减，引用归零即回收，in-flight 跟踪防止误删并发上传。
+6. **重启恢复**：`gunicorn` worker 初始化时调用 `recover_on_startup()`，
+   将所有非终态任务置为 FAILED，清理 `.partial-*` / `.incoming-*`
+   临时文件、无主的输出与上传目录，并对共享存储执行 GC——已受理任务
+   的输入因引用计数 ≥1 始终完整可读，未引用遗留被回收。
+7. **单进程多线程**：SQLite 与后台 worker 为进程内状态，因此 gunicorn
+   固定 1 个 worker、多线程承载并发轮询。任务认领是
+   `UPDATE ... WHERE status='QUEUED'` 的原子比较交换，且全部 netCDF4
+   访问由进程级互斥锁串行化（HDF5 非线程安全），即使误起多个 worker
+   线程也不会并发进入提取引擎。
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DATA_HOME` | `/data` | 上传、输出、临时文件与 SQLite 的根目录（Docker 卷） |
-| `TIME_CHUNK` | `64` | 每次读取的时间记录数，控制内存上界 |
+| `DATA_HOME` | `/data` | 共享存储、输出、临时文件与 SQLite 的根目录（Docker 卷） |
+| `TIME_CHUNK` | `64` | 每次读取的时间记录数，控制提取内存上界 |
+| `UPLOAD_CHUNK` | `1048576` | 上传接收/散列/落盘的分块字节数，控制接收内存上界 |
 | `MAX_UPLOAD_MB` | `2048` | 单次请求上传大小上限（MB） |
 | `PORT` | `8000` | 监听端口 |

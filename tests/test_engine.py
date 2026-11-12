@@ -3,17 +3,21 @@
 Run from the repository root:
     python -I -m unittest discover -s tests -v
 """
+import atexit
 import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-# Isolate all runtime data before importing the app package. The two test
-# modules run in one process under `unittest discover`, so share one HOME.
+# Isolate all runtime data before importing the app package. The test
+# modules run in one process under `unittest discover`, so share one HOME;
+# it is removed at process exit (not in tearDownClass) so later modules in
+# the same run still find it intact.
 _TMP_HOME = Path(os.environ.setdefault(
     "NC_TEST_HOME", tempfile.mkdtemp(prefix="nc-home-")))
 os.environ["DATA_HOME"] = str(_TMP_HOME)
+atexit.register(shutil.rmtree, str(_TMP_HOME), ignore_errors=True)
 
 import netCDF4 as nc
 import numpy as np
@@ -41,10 +45,6 @@ class EngineTest(unittest.TestCase):
     def tearDownClass(cls):
         config.TIME_CHUNK = cls._old_chunk
         shutil.rmtree(cls.tmp, ignore_errors=True)
-        # The shared DATA_HOME may still be used by test_jobs in the same
-        # process; leave cleanup to the process exit / the last test module.
-        if "NC_TEST_HOME" not in os.environ:
-            shutil.rmtree(cls.home, ignore_errors=True)
 
     def _out_path(self, name):
         return str(self.out_dir / name)

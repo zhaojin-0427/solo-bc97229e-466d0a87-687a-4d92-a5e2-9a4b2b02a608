@@ -1,4 +1,5 @@
 """Tests for job persistence, restart recovery and the Flask web flow."""
+import atexit
 import io
 import os
 import shutil
@@ -8,11 +9,14 @@ import unittest
 from pathlib import Path
 
 # Isolate runtime data before importing the app; share the HOME created by
-# the engine test module when both run in one discover process.
+# the engine test module when both run in one discover process. The home is
+# removed at process exit (not in tearDownClass) so later test modules in
+# the same discover run still find it intact.
 _TMP_HOME = Path(os.environ.setdefault(
     "NC_TEST_HOME", tempfile.mkdtemp(prefix="nc-home-job-")))
 os.environ["DATA_HOME"] = str(_TMP_HOME)
 os.environ["TIME_CHUNK"] = "2"
+atexit.register(shutil.rmtree, str(_TMP_HOME), ignore_errors=True)
 
 from app import config, jobs
 from app.web import app
@@ -29,7 +33,6 @@ class JobLayerTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
-        shutil.rmtree(_TMP_HOME, ignore_errors=True)
 
     def _wait(self, job_id, timeout=30):
         deadline = time.time() + timeout

@@ -93,40 +93,42 @@ REQUIRED_DIMS = ("time", "lat", "lon")
 REQUIRED_VARS = ("time", "lat", "lon", "temperature")
 
 
-def _read_coords(path: str) -> dict:
+def _read_coords(path: str, label: str = None) -> dict:
+    name = label or os.path.basename(path)
     with nc.Dataset(path, "r") as ds:
-        for name in REQUIRED_DIMS:
-            if name not in ds.dimensions:
-                raise ExtractionError(f"{os.path.basename(path)} 缺少维度 {name}")
-        for name in REQUIRED_VARS:
-            if name not in ds.variables:
-                raise ExtractionError(f"{os.path.basename(path)} 缺少变量 {name}")
+        for name_dim in REQUIRED_DIMS:
+            if name_dim not in ds.dimensions:
+                raise ExtractionError(f"{name} 缺少维度 {name_dim}")
+        for name_var in REQUIRED_VARS:
+            if name_var not in ds.variables:
+                raise ExtractionError(f"{name} 缺少变量 {name_var}")
         t = ds.variables["time"][:]
         lat = ds.variables["lat"][:]
         lon = ds.variables["lon"][:]
         temp = ds.variables["temperature"]
         if t.ndim != 1 or lat.ndim != 1 or lon.ndim != 1:
-            raise ExtractionError(f"{os.path.basename(path)} 坐标变量必须是一维")
+            raise ExtractionError(f"{name} 坐标变量必须是一维")
         if temp.dimensions != ("time", "lat", "lon"):
             raise ExtractionError(
-                f"{os.path.basename(path)} temperature 维度必须为 "
+                f"{name} temperature 维度必须为 "
                 "(time, lat, lon)")
         if t.size > 1 and np.any(np.diff(t.astype(np.int64)) <= 0):
-            raise ExtractionError(f"{os.path.basename(path)} time 必须严格递增")
+            raise ExtractionError(f"{name} time 必须严格递增")
         if lat.size > 1:
             dlat = np.diff(lat)
             if not (np.all(dlat > 0) or np.all(dlat < 0)):
                 raise ExtractionError(
-                    f"{os.path.basename(path)} lat 必须严格单调")
+                    f"{name} lat 必须严格单调")
         if np.any(lon < 0.0) or np.any(lon >= 360.0):
-            raise ExtractionError(f"{os.path.basename(path)} lon 必须位于 [0,360)")
+            raise ExtractionError(f"{name} lon 必须位于 [0,360)")
         if lon.size > 1 and np.any(np.diff(lon) <= 0):
-            raise ExtractionError(f"{os.path.basename(path)} lon 必须严格递增")
+            raise ExtractionError(f"{name} lon 必须严格递增")
         fill = getattr(temp, "_FillValue", None)
         if fill is None:
             fill = getattr(temp, "missing_value", None)
         return {
             "path": path,
+            "name": name,
             "time": np.array(t, dtype=np.int64),
             "lat": np.array(lat, dtype=np.float64),
             "lon": np.array(lon, dtype=np.float64),
@@ -145,15 +147,20 @@ class Selection:
     east: float
 
 
-def validate_files(paths: Sequence[str], sel: Selection) -> dict:
+def validate_files(paths: Sequence[str], sel: Selection,
+                   display_names: Optional[Sequence[str]] = None) -> dict:
     """Open every file once, validate structure and shared-grid identity,
-    and pre-compute per-file index maps."""
+    and pre-compute per-file index maps. ``display_names`` (e.g. the original
+    upload names for shared-store jobs) is used in error messages instead of
+    the on-disk paths."""
     if not paths:
         raise ExtractionError("至少需要上传一个 NetCDF 文件")
     if sel.t_start > sel.t_end:
         raise ExtractionError("时间起始不能晚于结束")
+    if display_names is None:
+        display_names = [os.path.basename(p) for p in paths]
 
-    metas = [_read_coords(p) for p in paths]
+    metas = [_read_coords(p, n) for p, n in zip(paths, display_names)]
     base = metas[0]
 
     # Shared grid set: same number of points and identical coordinate values.
@@ -165,13 +172,13 @@ def validate_files(paths: Sequence[str], sel: Selection) -> dict:
         if m["lat"].shape != base_lat_sorted.shape or \
                 not np.array_equal(np.sort(m["lat"]), base_lat_sorted):
             raise ExtractionError(
-                f"{os.path.basename(m['path'])} 与首个文件的纬度格点集合不一致")
+                f"{m['name']} 与首个文件的纬度格点集合不一致")
         if m["lon"].shape != base_lon.shape or not np.array_equal(m["lon"], base_lon):
             raise ExtractionError(
-                f"{os.path.basename(m['path'])} 与首个文件的经度格点集合不一致")
+                f"{m['name']} 与首个文件的经度格点集合不一致")
         if m["dtype"] != base_dtype:
             raise ExtractionError(
-                f"{os.path.basename(m['path'])} temperature 数据类型 "
+                f"{m['name']} temperature 数据类型 "
                 f"{m['dtype']} 与首个文件 {base_dtype} 不一致")
 
     lat_idx = lat_selection_indices(base["lat"], sel.south, sel.north)
@@ -192,6 +199,7 @@ def validate_files(paths: Sequence[str], sel: Selection) -> dict:
         i1 = int(np.searchsorted(t, sel.t_end, side="right"))
         file_maps.append({
             "path": m["path"],
+            "label": m["name"],
             "fill": m["fill"],
             "time_idx": np.arange(i0, i1, dtype=np.int64),
             "lat_idx": f_lat_idx,
@@ -223,6 +231,7 @@ class FileStream:
 
     def __init__(self, fm: dict, chunk_size: int):
         self.path = fm["path"]
+        self.label = fm.get("label") or os.path.basename(self.path)
         self.time_idx = fm["time_idx"]
         self.lat_idx = fm["lat_idx"]
         self.lon_idx = fm["lon_idx"]
@@ -304,10 +313,11 @@ def _merge_into(acc_data: np.ndarray, acc_mask: np.ndarray,
 
 def run_extraction(paths: Sequence[str], sel: Selection,
                    output_path: str,
-                   progress: Optional[Callable[[int, int], None]] = None) -> dict:
+                   progress: Optional[Callable[[int, int], None]] = None,
+                   display_names: Optional[Sequence[str]] = None) -> dict:
     """Execute the full extraction. Writes to a temp file and atomically
     renames on success; on failure the temp file is removed."""
-    plan = validate_files(paths, sel)
+    plan = validate_files(paths, sel, display_names=display_names)
     fmaps = plan["file_maps"]
     out_lat = plan["out_lat"]
     out_lon = plan["out_lon"]
@@ -398,7 +408,7 @@ def run_extraction(paths: Sequence[str], sel: Selection,
                     row = pending_pos[i]
                     _merge_into(acc_data, acc_mask,
                                 pending_d[i][row], pending_m[i][row],
-                                os.path.basename(streams[i].path), t_now)
+                                streams[i].label, t_now)
                     pending_pos[i] += 1
                     done_records += 1
                     if pending_pos[i] >= slab_t.size:

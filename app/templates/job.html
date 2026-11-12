@@ -3,11 +3,32 @@
 {% block body %}
 <div class="card" id="job-card" data-job-id="{{ job.id }}">
   <h2>任务 <code>{{ job.id[:12] }}</code></h2>
-  <p>状态：<span class="badge {{ job.status }}" id="status">{{ job.status }}</span></p>
+  <p>状态：<span class="badge {{ job.status }}" id="status">{{ job.status }}</span>
+    存储：{% if job.storage == 'shared' %}<span class="badge SHARED">共享存储</span>{% else %}<span class="badge LEGACY">独立存储</span>{% endif %}
+  </p>
   <p class="hint" id="progress-text">{{ job.progress }} / {{ job.total }} 条时间记录</p>
   <div class="bar"><div id="bar" style="width:
     {% if job.total %}{{ (job.progress * 100 / job.total)|round(0)|int }}%{% else %}0%{% endif %}">
   </div></div>
+
+  {% if inputs %}
+  <h3>输入归档（{{ inputs|length }} 个）</h3>
+  <table>
+    <thead><tr><th>原始文件名</th>{% if job.storage == 'shared' %}<th>SHA-256</th><th>大小</th>{% endif %}</tr></thead>
+    <tbody>
+    {% for f in inputs %}
+      <tr>
+        <td>{{ f.name }}</td>
+        {% if job.storage == 'shared' %}
+        <td><code>{{ f.sha256 }}…</code></td>
+        <td>{{ f.size|humanbytes }}</td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
   <div id="error-box" style="margin-top:14px">
     {% if job.error %}<p class="err">{{ job.error }}</p>{% endif %}
   </div>
@@ -15,6 +36,14 @@
     {% if job.status == 'SUCCEEDED' %}
     <a href="{{ url_for('download', job_id=job.id) }}">
       <button type="button" style="margin:0">下载结果 NetCDF</button></a>
+    {% endif %}
+  </div>
+  <div id="delete-box" style="margin-top:14px">
+    {% if job.status in ['SUCCEEDED', 'FAILED'] %}
+    <form method="post" action="{{ url_for('delete_job', job_id=job.id) }}"
+          onsubmit="return confirm('删除该任务？其输入引用将被释放，结果文件将被删除。');">
+      <button type="submit" class="danger" style="margin:0">删除任务</button>
+    </form>
     {% endif %}
   </div>
   <p style="margin-top:18px"><a href="{{ url_for('index') }}">← 返回首页</a></p>
@@ -40,10 +69,12 @@
       clearInterval(timer);
       document.getElementById('download-box').innerHTML =
         `<a href="${j.download}"><button type="button" style="margin:0">下载结果 NetCDF</button></a>`;
+      location.reload();
     } else if (j.status === 'FAILED') {
       clearInterval(timer);
       document.getElementById('error-box').innerHTML =
         `<p class="err">${(j.error || '任务失败').replace(/</g,'&lt;')}</p>`;
+      location.reload();
     }
   }, 1000);
 })();

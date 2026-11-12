@@ -2,8 +2,8 @@
 {% block title %}请求错误{% endblock %}
 {% block body %}
 <div class="card">
-  <h2>无法提交任务</h2>
+  <h2>操作无法完成</h2>
   <p class="err">{{ message }}</p>
-  <p style="margin-top:16px"><a href="{{ url_for('index') }}">← 返回首页重试</a></p>
+  <p style="margin-top:16px"><a href="{{ url_for('index') }}">← 返回首页</a></p>
 </div>
 {% endblock %}

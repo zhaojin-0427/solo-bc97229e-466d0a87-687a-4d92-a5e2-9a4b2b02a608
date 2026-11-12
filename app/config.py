@@ -9,9 +9,10 @@ def _data_home() -> Path:
 
 
 DATA_HOME = _data_home()
-UPLOAD_DIR = DATA_HOME / "uploads"
+UPLOAD_DIR = DATA_HOME / "uploads"      # legacy per-job uploads (pre-shared-store jobs)
 OUTPUT_DIR = DATA_HOME / "outputs"
 TMP_DIR = DATA_HOME / "tmp"
+STORE_DIR = DATA_HOME / "store"         # shared content-addressed archive store
 DB_PATH = DATA_HOME / "jobs.db"
 
 # Number of time records pulled from each input file in one read.
@@ -26,5 +27,9 @@ COMPRESSION_LEVEL = 4
 # Upload limits
 MAX_CONTENT_LENGTH = int(os.environ.get("MAX_UPLOAD_MB", "2048")) * 1024 * 1024
 
-for _d in (UPLOAD_DIR, OUTPUT_DIR, TMP_DIR):
+# Chunk size for streaming uploads to disk while hashing. Memory per in-flight
+# upload is bounded by this buffer, independent of the uploaded file size.
+UPLOAD_CHUNK = int(os.environ.get("UPLOAD_CHUNK", str(1024 * 1024)))
+
+for _d in (UPLOAD_DIR, OUTPUT_DIR, TMP_DIR, STORE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
